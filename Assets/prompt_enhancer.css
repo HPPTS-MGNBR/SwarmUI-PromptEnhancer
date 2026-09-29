@@ -1,0 +1,53 @@
+/* Right-align the Prompt Enhancer dropdowns, with the Edit button after the system prompt one. */
+.auto-dropdown-box select[data-param_id="pesystemprompt"],
+.auto-dropdown-box select[data-param_id="peencodertype"] {
+    margin-left: auto;
+}
+.pe-sysprompt-edit-button {
+    margin-left: 0.3rem;
+}
+
+/* System prompt editor popup: 16:9, with the text area filling what's left. */
+.modal-dialog.pe-sysprompt-dialog {
+    width: min(94vw, 1280px);
+    max-width: min(94vw, 1280px);
+}
+/* Swarm makes every .modal-content fit-content, which would shrink it back around its children. */
+.pe-sysprompt-dialog .modal-content {
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    max-height: 90vh;
+}
+.pe-sysprompt-dialog .modal-body {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    flex: 1;
+    min-height: 0;
+}
+.pe-sysprompt-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+.pe-sysprompt-toolbar .auto-text {
+    flex: 1;
+}
+.pe-sysprompt-text {
+    flex: 1;
+    min-height: 0;
+    resize: none;
+}
+
+/* Enhance button: top-left edge of the prompt box, clear of Magic Prompt's centered buttons and the right-side token count. */
+.pe-enhance-button {
+    position: absolute;
+    left: 2.5rem;
+    top: calc(0.5rem - 5px);
+    z-index: 1;
+    padding: 0.2rem 0.8rem;
+    border-radius: 0.7rem;
+    font-weight: bold;
+    font-size: 0.7em;
+    line-height: 1;
+}
