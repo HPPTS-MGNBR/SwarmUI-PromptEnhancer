@@ -35,7 +35,7 @@ and is saved to the image metadata as `enhanced_prompt` alongside your original 
 
 The `✨ PE Enhance` button at the top-left of the prompt box rewrites the prompt in place, without
 generating an image. Only the text before the first `<tag>` is rewritten; sections, LoRAs and wildcards after it are kept as-is.
-**Prompt images are not sent in this mode.**
+Prompt images are sent too when `Use Prompt Images` is on.
 
 ## Notes
 

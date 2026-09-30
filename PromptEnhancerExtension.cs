@@ -95,7 +95,7 @@ public class PromptEnhancerExtension : Extension
         SystemPrompt = T2IParamTypes.Register<string>(new("[PE] System Prompt", "Which system prompt instructs the encoder on how to rewrite your prompt.\n'None' sends your prompt through the encoder's own default template.\nUse the 'Edit' button to manage your system prompts.",
             DefaultSystemPrompt, Group: Group, FeatureFlag: Feature, OrderPriority: 2, GetValues: session => ["None", .. SystemPromptsFor(session?.User).Keys.OrderBy(k => k.ToLowerFast())]
             ));
-        PromptImages = T2IParamTypes.Register<bool>(new("[PE] Use Prompt Images", "Also show the images attached to your prompt to the encoder, so it can describe and build on them.\nOnly works with vision-capable encoders (Qwen3-VL, Gemma 3/4, ...) whose own chat template is in use - ie with 'None', or a model that takes its system prompt natively.\nFollows the 'Text Encoded Image' setting for image sizing.",
+        PromptImages = T2IParamTypes.Register<bool>(new("[PE] Use Prompt Images", "Also show the images attached to your prompt to the encoder, so it can describe and build on them.\nOnly works with vision-capable encoders (Qwen3-VL, Gemma 3/4, ...).\nFollows the 'Text Encoded Image' setting for image sizing.",
             "false", Group: Group, FeatureFlag: Feature, OrderPriority: 3
             ));
         EncoderType = T2IParamTypes.Register<string>(new("[PE] Encoder Type", "Which ComfyUI text encoder type to load an explicitly chosen encoder as.\nLeave off to use the type that matches the current diffusion model.",
@@ -232,8 +232,6 @@ public class PromptEnhancerExtension : Extension
         {
             input.Set(SystemPrompt, DefaultSystemPrompt);
         }
-        // Prompt images go through upload placeholders that only a full generation fills in.
-        input.Remove(PromptImages);
         // Load the model's encoder exactly as a generation would, then run only the enhancement: Comfy skips the loader nodes nothing depends on.
         WorkflowGenerator g = new() { UserInput = input, ModelFolderFormat = backend.ModelFolderFormat, Features = [.. backend.SupportedFeatures], Workflow = [] };
         g.FinalLoadedModel = model;
