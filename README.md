@@ -37,6 +37,12 @@ The `✨ PE Enhance` button at the top-left of the prompt box rewrites the promp
 generating an image. Only the text before the first `<tag>` is rewritten; sections, LoRAs and wildcards after it are kept as-is.
 Prompt images are sent too when `Use Prompt Images` is on.
 
+### Captioning
+
+`PE Caption`, in the `More` dropdown next to the active image, describes that image with the text encoder
+and replaces the prompt with the description. It uses the built-in `Caption` system prompt, unless you picked
+another one than `Default`. Needs a vision-capable encoder (Qwen3-VL, Gemma 3/4, ...).
+
 ## Notes
 
 - Negative prompts are never rewritten.

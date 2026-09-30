@@ -3,6 +3,7 @@ using Newtonsoft.Json.Linq;
 using SwarmUI.Accounts;
 using SwarmUI.Builtin_ComfyUIBackend;
 using SwarmUI.Core;
+using SwarmUI.Media;
 using SwarmUI.Text2Image;
 using SwarmUI.Utils;
 using SwarmUI.WebAPI;
@@ -47,6 +48,29 @@ public class PromptEnhancerExtension : Extension
         Output only the revised prompt and nothing else.
         """;
 
+    /// <summary>Name of the built-in captioning system prompt, used by the 'PE Caption' image button when the user left the selection on <see cref="DefaultSystemPrompt"/>.</summary>
+    public const string CaptionSystemPrompt = "Caption";
+
+    const string CaptionSystemPromptText = """
+        You are an expert image captioner. Describe the provided image as a detailed text-to-image prompt that would recreate it.
+
+        Guidelines:
+        1. Subjects: Describe every main subject precisely - appearance, pose, expression, clothing, and actions.
+        2. Scene: Describe the setting, background, and spatial relationships between elements.
+        3. Visuals: Describe the medium and style (photo, painting, 3D render, ...), composition and framing, camera angle, lighting (quality, direction, color), color palette, and textures.
+        4. Text in Images: Transcribe all visible text exactly, in quotation marks.
+        5. Facts only: Describe only what is visible. Never guess or invent details.
+
+        Output a single detailed paragraph, only the description and nothing else.
+        """;
+
+    /// <summary>Built-in system prompts, by name. A user prompt of the same name overrides one; deleting it restores the original.</summary>
+    static readonly Dictionary<string, string> BuiltinSystemPrompts = new()
+    {
+        [DefaultSystemPrompt] = DefaultSystemPromptText,
+        [CaptionSystemPrompt] = CaptionSystemPromptText
+    };
+
     /// <summary>User generic-data key the user's system prompts are stored under, as a single JSON object of name to text.</summary>
     const string DataName = "prompt_enhancer";
 
@@ -71,6 +95,7 @@ public class PromptEnhancerExtension : Extension
         API.RegisterAPICall(PromptEnhancerSaveSystemPrompt, true, PermEditSystemPrompts);
         API.RegisterAPICall(PromptEnhancerDeleteSystemPrompt, true, PermEditSystemPrompts);
         API.RegisterAPICall(PromptEnhancerEnhancePrompt, false, Permissions.BasicImageGeneration);
+        API.RegisterAPICall(PromptEnhancerCaptionImage, false, Permissions.BasicImageGeneration);
         // Before LoRAs get applied at -10, so we can drive text generation from the raw text encoder.
         WorkflowGenerator.AddModelGenStep(TrackBaseModel, -11);
         // After every stage (refiner, segments, video, ...) has encoded its prompts, and before post-cleanup at 200.
@@ -151,10 +176,10 @@ public class PromptEnhancerExtension : Extension
         return string.IsNullOrWhiteSpace(raw) ? [] : raw.ParseToJson();
     }
 
-    /// <summary>All system prompts available to the user, by name: the built-in one, overridden or extended by their own.</summary>
+    /// <summary>All system prompts available to the user, by name: the built-in ones, overridden or extended by their own.</summary>
     public static Dictionary<string, string> SystemPromptsFor(User user)
     {
-        Dictionary<string, string> result = new() { [DefaultSystemPrompt] = DefaultSystemPromptText };
+        Dictionary<string, string> result = new(BuiltinSystemPrompts);
         foreach ((string name, JToken text) in StoredSystemPrompts(user))
         {
             result[name] = $"{text}";
@@ -162,7 +187,7 @@ public class PromptEnhancerExtension : Extension
         return result;
     }
 
-    static JObject SystemPromptsResponse(User user) => new() { ["prompts"] = JObject.FromObject(SystemPromptsFor(user)), ["builtin"] = DefaultSystemPrompt };
+    static JObject SystemPromptsResponse(User user) => new() { ["prompts"] = JObject.FromObject(SystemPromptsFor(user)), ["builtins"] = JArray.FromObject(BuiltinSystemPrompts.Keys) };
 
     public static async Task<JObject> PromptEnhancerListSystemPrompts(Session session)
     {
@@ -191,7 +216,7 @@ public class PromptEnhancerExtension : Extension
     }
 
     public static async Task<JObject> PromptEnhancerDeleteSystemPrompt(Session session,
-        [API.APIParameter("Name of the system prompt to delete. Deleting the built-in one's name restores its original text.")] string name)
+        [API.APIParameter("Name of the system prompt to delete. Deleting a built-in one's name restores its original text.")] string name)
     {
         JObject stored = StoredSystemPrompts(session.User);
         stored.Remove(name ?? "");
@@ -215,35 +240,56 @@ public class PromptEnhancerExtension : Extension
         {
             return new() { ["error"] = "Nothing to enhance: the prompt has no plain text before its first <tag>." };
         }
-        ComfyUIAPIAbstractBackend backend = ComfyUIBackendExtension.RunningComfyBackends.FirstOrDefault(b => b.SupportedFeatures.Contains(Feature));
-        if (backend is null)
-        {
-            return new() { ["error"] = "No running ComfyUI backend supports the 'TextGenerate' node." };
-        }
-        T2IModel model = input.Get(T2IParamTypes.Model, null);
-        if (model is null)
-        {
-            return new() { ["error"] = "No model selected." };
-        }
-        // A random seed per click when the seed is left at -1, so re-clicking gives a new result.
-        input.LockSeeds();
         // Parameters are left out of the input when the group is toggled off, so fall back to the built-in system prompt rather than none.
         if (!input.TryGet(SystemPrompt, out string _))
         {
             input.Set(SystemPrompt, DefaultSystemPrompt);
         }
-        // Load the model's encoder exactly as a generation would, then run only the enhancement: Comfy skips the loader nodes nothing depends on.
+        string enhanced = await RunStandalone(input, head);
+        return new() { ["prompt"] = tail == "" ? enhanced : $"{enhanced}\n{tail}" };
+    }
+
+    /// <summary>Describes an image as a prompt, for the 'PE Caption' image button.
+    /// Uses the built-in captioning system prompt, unless the user picked a system prompt other than <see cref="DefaultSystemPrompt"/>.</summary>
+    public static async Task<JObject> PromptEnhancerCaptionImage(Session session,
+        [API.APIParameter("Raw mapping of the generate tab's current parameters, same format as 'GenerateText2Image', plus 'pe_caption_image': the image to caption, as a data URL.")] JObject rawInput)
+    {
+        string imageData = $"{rawInput["pe_caption_image"]}";
+        rawInput.Remove("pe_caption_image");
+        if (!imageData.StartsWith("data:image/"))
+        {
+            return new() { ["error"] = "No image to caption." };
+        }
+        T2IParamInput input = T2IAPI.RequestToParams(session, rawInput);
+        if (input.Get(SystemPrompt, DefaultSystemPrompt) == DefaultSystemPrompt)
+        {
+            input.Set(SystemPrompt, CaptionSystemPrompt);
+        }
+        // The captioned image is the only image the encoder sees, whatever is attached to the prompt box.
+        input.Set(T2IParamTypes.PromptImages, [(Image)ImageFile.FromDataString(imageData)]);
+        input.Set(PromptImages, true);
+        return new() { ["prompt"] = await RunStandalone(input, "Describe this image.") };
+    }
+
+    /// <summary>Runs a single text generation outside of any image generation: loads the model's encoder exactly as a generation would, then runs only the 'TextGenerate' node (Comfy skips the loader nodes nothing depends on).</summary>
+    static async Task<string> RunStandalone(T2IParamInput input, string prompt)
+    {
+        ComfyUIAPIAbstractBackend backend = ComfyUIBackendExtension.RunningComfyBackends.FirstOrDefault(b => b.SupportedFeatures.Contains(Feature))
+            ?? throw new SwarmUserErrorException("No running ComfyUI backend supports the 'TextGenerate' node.");
+        T2IModel model = input.Get(T2IParamTypes.Model, null) ?? throw new SwarmUserErrorException("No model selected.");
+        // A random seed per click when the seed is left at -1, so re-clicking gives a new result.
+        input.LockSeeds();
         WorkflowGenerator g = new() { UserInput = input, ModelFolderFormat = backend.ModelFolderFormat, Features = [.. backend.SupportedFeatures], Workflow = [] };
         g.FinalLoadedModel = model;
         g.FinalLoadedModelList = [model];
         (g.FinalLoadedModel, g.CurrentModel, g.CurrentTextEnc, g.CurrentVae) = g.CreateModelLoader(model, "Base", "4", sectionId: T2IParamInput.SectionID_BaseOnly);
-        Enhance(g, Prepare(g), head, "enhanced_prompt");
+        Enhance(g, Prepare(g), prompt, "enhanced_prompt");
         await backend.AwaitJobLive(g.Workflow.ToString(), "0", _ => { }, input, Program.GlobalProgramCancel);
-        if (input.ExtraMeta.GetValueOrDefault("custom_enhanced_prompt") is not string enhanced || string.IsNullOrWhiteSpace(enhanced))
+        if (input.ExtraMeta.GetValueOrDefault("custom_enhanced_prompt") is not string text || string.IsNullOrWhiteSpace(text))
         {
-            return new() { ["error"] = "The text encoder returned no text." };
+            throw new SwarmUserErrorException("The text encoder returned no text.");
         }
-        return new() { ["prompt"] = tail == "" ? enhanced : $"{enhanced}\n{tail}" };
+        return text;
     }
 
     /// <summary>Everything a 'TextGenerate' node needs beyond the prompt itself, resolved once per generation.</summary>

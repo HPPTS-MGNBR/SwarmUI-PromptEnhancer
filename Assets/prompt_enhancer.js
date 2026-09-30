@@ -2,7 +2,7 @@
 class PromptEnhancerSystemPrompts {
     constructor() {
         this.prompts = {};
-        this.builtin = 'Default';
+        this.builtins = ['Default'];
         this.selected = null;
         this.modal = null;
         postParamBuildSteps.push(() => this.addButton());
@@ -66,7 +66,7 @@ class PromptEnhancerSystemPrompts {
         genericRequest('PromptEnhancerListSystemPrompts', {}, data => {
             this.load(data);
             let current = document.getElementById('input_pesystemprompt')?.value;
-            this.select(current in this.prompts ? current : this.builtin);
+            this.select(current in this.prompts ? current : this.builtins[0]);
             $(this.modal).modal('show');
         });
     }
@@ -74,7 +74,7 @@ class PromptEnhancerSystemPrompts {
     /** Takes in a server response listing the system prompts, and rebuilds the popup's list. */
     load(data) {
         this.prompts = data.prompts;
-        this.builtin = data.builtin;
+        this.builtins = data.builtins;
         // Placeholder shown while editing a new, not yet saved, system prompt.
         this.list.innerHTML = '<option value="" disabled hidden>(new)</option>';
         let names = Object.keys(this.prompts).sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
@@ -92,7 +92,7 @@ class PromptEnhancerSystemPrompts {
         this.list.value = name ?? '';
         this.nameInput.value = name ?? '';
         this.textInput.value = name ? this.prompts[name] : '';
-        this.deleteButton.innerText = name == this.builtin ? 'Reset' : 'Delete';
+        this.deleteButton.innerText = this.builtins.includes(name) ? 'Reset' : 'Delete';
         this.deleteButton.disabled = name == null;
     }
 
@@ -112,12 +112,12 @@ class PromptEnhancerSystemPrompts {
     /** Deletes the selected system prompt, or resets the built-in one to its original text. */
     delete() {
         let name = this.selected;
-        if (name == null || (name != this.builtin && !confirm(`Delete the system prompt '${name}'?`))) {
+        if (name == null || (!this.builtins.includes(name) && !confirm(`Delete the system prompt '${name}'?`))) {
             return;
         }
         genericRequest('PromptEnhancerDeleteSystemPrompt', { name: name }, data => {
             this.load(data);
-            this.select(name in this.prompts ? name : this.builtin);
+            this.select(name in this.prompts ? name : this.builtins[0]);
             this.syncDropdown(this.selected);
         });
     }
@@ -167,11 +167,38 @@ class PromptEnhancerButton {
         });
     }
 
+    /** Describes the given image with the text encoder, and replaces the prompt with the result. */
+    caption(src) {
+        if (this.button.disabled) {
+            return;
+        }
+        this.setBusy(true, '✨ Captioning...');
+        let send = (data) => {
+            genericRequest('PromptEnhancerCaptionImage', getGenInput({ pe_caption_image: data }), result => {
+                this.setBusy(false);
+                this.box.value = result.prompt;
+                triggerChangeFor(this.box);
+            }, 0, e => {
+                this.setBusy(false);
+                showError(e);
+            });
+        };
+        if (src.startsWith('data:')) {
+            send(src);
+        }
+        else {
+            toDataURL(src, send);
+        }
+    }
+
     /** Locks the button while a request is running. */
-    setBusy(busy) {
+    setBusy(busy, text = '✨ Enhancing...') {
         this.button.disabled = busy;
-        this.button.innerText = busy ? '✨ Enhancing...' : this.label;
+        this.button.innerText = busy ? text : this.label;
     }
 }
 
 promptEnhancerButton = new PromptEnhancerButton();
+
+// In the 'More' dropdown, not in the visible button row. Also shown in the history panel: extensions that wrap 'buttonsForImage' (eg Base2Edit) can drop its 'isCurrentImage' argument, which would hide a current-image-only button everywhere.
+registerMediaButton('PE Caption', src => promptEnhancerButton.caption(src), 'Prompt Enhancer: describe this image with the text encoder, and replace the prompt with the description.\nUses the built-in \'Caption\' system prompt, unless you picked another one than \'Default\'.', ['image']);
