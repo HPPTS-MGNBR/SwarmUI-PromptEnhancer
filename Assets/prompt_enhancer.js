@@ -157,7 +157,7 @@ class PromptEnhancerButton {
             return;
         }
         this.setBusy(true);
-        genericRequest('PromptEnhancerEnhancePrompt', getGenInput(), data => {
+        genericRequest('PromptEnhancerEnhancePrompt', this.genInput(), data => {
             this.setBusy(false);
             this.box.value = data.prompt;
             triggerChangeFor(this.box);
@@ -174,7 +174,7 @@ class PromptEnhancerButton {
         }
         this.setBusy(true, '✨ Captioning...');
         let send = (data) => {
-            genericRequest('PromptEnhancerCaptionImage', getGenInput({ pe_caption_image: data }), result => {
+            genericRequest('PromptEnhancerCaptionImage', this.genInput({ pe_caption_image: data }), result => {
                 this.setBusy(false);
                 this.box.value = result.prompt;
                 triggerChangeFor(this.box);
@@ -189,6 +189,26 @@ class PromptEnhancerButton {
         else {
             toDataURL(src, send);
         }
+    }
+
+    /** The generate tab's input, plus the Prompt Enhancer parameters even while their group is toggled off: the buttons are an explicit request, so they use the settings as shown.
+     * (getGenInput skips every parameter of a disabled group.) A parameter's own toggle, eg '[PE] Encoder Type', is still respected. */
+    genInput(overrides = {}) {
+        let input = getGenInput(overrides);
+        for (let param of gen_param_types) {
+            let group = param.original_group || param.group;
+            if (group?.id != 'promptenhancer' || param.id in input || param.feature_missing) {
+                continue;
+            }
+            if (param.toggleable && !getRequiredElementById(`input_${param.id}_toggle`).checked) {
+                continue;
+            }
+            let val = getInputVal(getRequiredElementById(`input_${param.id}`), true);
+            if (val != null) {
+                input[param.id] = val;
+            }
+        }
+        return input;
     }
 
     /** Locks the button while a request is running. */
