@@ -226,26 +226,103 @@ public class PromptEnhancerExtension : Extension
 
     #endregion
 
+    /// <summary>Prompt functions that only produce text: resolved before text generation, and replaced by the enhanced text in the prompt box.</summary>
+    public static HashSet<string> TextFunctions = ["wildcard", "wc", "random", "alternate", "alt", "fromto", "repeat", "var", "macro"];
+
+    /// <summary>Prompt functions that define a variable or macro: resolved for text generation too, but also kept, silenced, so later sections can still use them.</summary>
+    public static HashSet<string> DefinitionFunctions = ["setvar", "setmacro"];
+
+    /// <summary>Lists the top-level '&lt;...&gt;' tags in a prompt (nested tags stay part of their parent), as (start, end) index ranges.</summary>
+    static List<(int Start, int End)> TopLevelTags(string text)
+    {
+        List<(int, int)> tags = [];
+        int depth = 0, start = 0;
+        for (int i = 0; i < text.Length; i++)
+        {
+            if (text[i] == '<')
+            {
+                if (depth++ == 0)
+                {
+                    start = i;
+                }
+            }
+            else if (text[i] == '>' && depth > 0 && --depth == 0)
+            {
+                tags.Add((start, i + 1));
+            }
+        }
+        return tags;
+    }
+
+    /// <summary>Gets the lowercase prefix of a raw '&lt;prefix[predata]:data&gt;' tag.</summary>
+    static string TagPrefix(string tag)
+    {
+        string inner = tag[1..^1];
+        int end = inner.IndexOfAny([':', '[']);
+        return (end < 0 ? inner : inner[..end]).Trim().ToLowerFast();
+    }
+
+    /// <summary>Rewrites a 'setvar'/'setmacro' tag in its silent form, which defines the value without inserting it in the prompt.</summary>
+    static string SilenceDefinition(string tag)
+    {
+        string inner = tag[1..^1];
+        int colon = inner.IndexOf(':');
+        int bracket = inner.IndexOf('[');
+        if (colon < 0 || bracket < 0 || bracket > colon)
+        {
+            return tag;
+        }
+        string name = inner[(bracket + 1)..colon].TrimEnd(']').Before(',');
+        return $"<{inner[..bracket]}[{name},false]:{inner[(colon + 1)..]}>";
+    }
+
     /// <summary>Enhances the prompt on its own, without generating an image, for the 'Enhance' button above the prompt box.
-    /// Only the text before the first '&lt;tag&gt;' is enhanced; the rest (sections, loras, wildcards, ...) is kept as-is after it.</summary>
+    /// Only the global text before the first section ('&lt;base&gt;', '&lt;segment:...&gt;', ...) is enhanced, sections are kept as-is after it.
+    /// In that text, prompt functions are resolved first (see <see cref="TextFunctions"/>), and tags that act on the generation itself (loras, presets, ...) are kept after the enhanced text.</summary>
     public static async Task<JObject> PromptEnhancerEnhancePrompt(Session session,
         [API.APIParameter("Raw mapping of the generate tab's current parameters, same format as 'GenerateText2Image'.")] JObject rawInput)
     {
         T2IParamInput input = T2IAPI.RequestToParams(session, rawInput);
         string prompt = input.Get(T2IParamTypes.Prompt, "");
-        int tagStart = prompt.IndexOf('<');
-        string head = (tagStart < 0 ? prompt : prompt[..tagStart]).Trim();
-        string tail = tagStart < 0 ? "" : prompt[tagStart..].Trim();
-        if (head == "")
+        int sectionStart = PromptRegion.PartPrefixes.Select(p => prompt.IndexOf(p, StringComparison.OrdinalIgnoreCase)).Where(i => i >= 0).DefaultIfEmpty(prompt.Length).Min();
+        string head = prompt[..sectionStart];
+        string tail = prompt[sectionStart..].Trim();
+        StringBuilder source = new();
+        List<string> kept = [];
+        int last = 0;
+        foreach ((int start, int end) in TopLevelTags(head))
         {
-            return new() { ["error"] = "Nothing to enhance: the prompt has no plain text before its first <tag>." };
+            source.Append(head[last..start]);
+            string tag = head[start..end];
+            string prefix = TagPrefix(tag);
+            if (TextFunctions.Contains(prefix) || DefinitionFunctions.Contains(prefix))
+            {
+                source.Append(tag);
+            }
+            if (!TextFunctions.Contains(prefix))
+            {
+                kept.Add(DefinitionFunctions.Contains(prefix) ? SilenceDefinition(tag) : tag);
+            }
+            last = end;
+        }
+        source.Append(head[last..]);
+        // Same resolution as a real generation does, so wildcards follow the wildcard seed and variables work. Embeddings and the like a wildcard may pull in are dropped, they mean nothing to the encoder.
+        string resolved = T2IPromptHandling.ProcessPromptLike(source.ToString(), new() { Input = input, Param = T2IParamTypes.Prompt.Type.ID }, false);
+        resolved = System.Text.RegularExpressions.Regex.Replace(resolved ?? "", "\0[^\0]*\0end", "").Replace("\0", "").Trim();
+        if (resolved == "")
+        {
+            return new() { ["error"] = "Nothing to enhance: the prompt has no text before its first section." };
         }
         // Parameters are left out of the input when the group is toggled off, so fall back to the built-in system prompt rather than none.
         if (!input.TryGet(SystemPrompt, out string _))
         {
             input.Set(SystemPrompt, DefaultSystemPrompt);
         }
-        string enhanced = await RunStandalone(input, head);
+        string enhanced = await RunStandalone(input, resolved);
+        if (kept.Any())
+        {
+            enhanced = $"{enhanced} {string.Join(" ", kept)}";
+        }
         return new() { ["prompt"] = tail == "" ? enhanced : $"{enhanced}\n{tail}" };
     }
 

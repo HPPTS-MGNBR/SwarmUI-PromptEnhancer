@@ -34,7 +34,10 @@ and is saved to the image metadata as `enhanced_prompt` alongside your original 
 ### Pre-Generation
 
 The `✨ PE Enhance` button at the top-left of the prompt box rewrites the prompt in place, without
-generating an image. Only the text before the first `<tag>` is rewritten; sections, LoRAs and wildcards after it are kept as-is.
+generating an image. Only the global text before the first section (`<base>`, `<segment:...>`, ...) is rewritten,
+sections are kept as-is. In that text, prompt functions (`<wildcard:>`, `<random:>`, `<var:>`, ...) are resolved first;
+`<setvar>`/`<setmacro>` are kept silenced so later sections still get their values, and tags acting on the generation
+itself (`<lora:>`, `<preset:>`, `<embed:>`, ...) are kept after the enhanced text.
 Prompt images are sent too when `Use Prompt Images` is on.
 
 ### Captioning
