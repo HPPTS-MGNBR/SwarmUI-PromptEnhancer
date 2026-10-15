@@ -29,7 +29,8 @@ Default sampling values should be sensible for most models, and are accessible w
 Enable the **Prompt Enhancer** group in the parameters column, set your params, then generate. 
 
 The prompt enhancement happens inside the generation workflow: the generated text is plugged into the prompt encoder node, 
-and is saved to the image metadata as `enhanced_prompt` alongside your original `prompt`.
+and is saved to the image metadata as `Enhanced Prompt` alongside your original `prompt`.
+The time spent generating text goes to `Enhancement Time` (all text generations summed, or `cached` when ComfyUI reused a previous result).
 
 ### Pre-Generation
 

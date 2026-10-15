@@ -7,6 +7,7 @@ using SwarmUI.Media;
 using SwarmUI.Text2Image;
 using SwarmUI.Utils;
 using SwarmUI.WebAPI;
+using System.Runtime.CompilerServices;
 
 namespace PromptEnhancer;
 
@@ -83,6 +84,7 @@ public class PromptEnhancerExtension : Extension
     public override void OnInit()
     {
         ComfyUIBackendExtension.NodeToFeatureMap["TextGenerate"] = Feature;
+        ComfyUIAPIAbstractBackend.AltCustomMetadataHandlers.Add(StoreMetadata);
         ComfyUIBackendExtension.RawObjectInfoParsers.Add(raw =>
         {
             if (ComfyUIBackendExtension.TryGetRequiredInputs(raw, "CLIPLoader", "type", out JToken types))
@@ -362,7 +364,7 @@ public class PromptEnhancerExtension : Extension
         (g.FinalLoadedModel, g.CurrentModel, g.CurrentTextEnc, g.CurrentVae) = g.CreateModelLoader(model, "Base", "4", sectionId: T2IParamInput.SectionID_BaseOnly);
         Enhance(g, Prepare(g), prompt, "enhanced_prompt");
         await backend.AwaitJobLive(g.Workflow.ToString(), "0", _ => { }, input, Program.GlobalProgramCancel);
-        if (input.ExtraMeta.GetValueOrDefault("custom_enhanced_prompt") is not string text || string.IsNullOrWhiteSpace(text))
+        if (input.ExtraMeta.GetValueOrDefault(EnhancedPromptMeta) is not string text || string.IsNullOrWhiteSpace(text))
         {
             throw new SwarmUserErrorException("The text encoder returned no text.");
         }
@@ -433,6 +435,86 @@ public class PromptEnhancerExtension : Extension
                 inputs[textKey] = enhance(text);
             }
         }
+        if (enhanced.Any())
+        {
+            TrackEnhancementTime(g.UserInput, [.. enhanced.Values.Select(v => $"{v[0]}")]);
+        }
+    }
+
+    /// <summary>Metadata name of the enhanced main prompt.</summary>
+    public const string EnhancedPromptMeta = "Enhanced Prompt";
+
+    /// <summary>Metadata name of the total text generation time.</summary>
+    public const string EnhancementTimeMeta = "Enhancement Time";
+
+    /// <summary>Stores the texts our 'SwarmAddSaveMetadataWS' nodes send back under a readable name (eg 'Enhanced Sub-Prompt A Thinking'), rather than Swarm's default 'custom_enhanced_subprompt_a_thinking'.
+    /// Only the letters of a metadata name are kept when Swarm builds output paths, which the sub-prompt letters keep distinct.</summary>
+    static bool StoreMetadata(T2IParamInput input, string key, string value)
+    {
+        System.Text.RegularExpressions.Match match = System.Text.RegularExpressions.Regex.Match(key, "^enhanced_(prompt|subprompt_([a-z]+))(_thinking)?$");
+        if (!match.Success)
+        {
+            return false;
+        }
+        string name = match.Groups[2].Success ? $"Enhanced Sub-Prompt {match.Groups[2].Value.ToUpperInvariant()}" : EnhancedPromptMeta;
+        input.ExtraMeta[match.Groups[3].Success ? $"{name} Thinking" : name] = value.Trim();
+        return true;
+    }
+
+    /// <summary>The 'TextGenerate' node IDs being timed for each generation request, so rebuilding a workflow for the same request doesn't wrap its backend data handler twice.</summary>
+    static readonly ConditionalWeakTable<T2IParamInput, HashSet<string>> TimedNodes = new();
+
+    /// <summary>Times the 'TextGenerate' nodes from the raw websocket events Swarm forwards during the job: a node runs from its 'executing' event until the next one.
+    /// The total goes to the image metadata as 'Enhancement Time', set before the image is saved since text generation runs ahead of sampling.</summary>
+    static void TrackEnhancementTime(T2IParamInput input, HashSet<string> nodeIds)
+    {
+        if (TimedNodes.TryGetValue(input, out HashSet<string> existing))
+        {
+            existing.Clear();
+            existing.UnionWith(nodeIds);
+            return;
+        }
+        TimedNodes.Add(input, nodeIds);
+        Action<string, byte[]> prior = input.ReceiveRawBackendData;
+        bool running = false;
+        long started = 0, total = 0;
+        input.ReceiveRawBackendData = (type, data) =>
+        {
+            prior?.Invoke(type, data);
+            // Only the small JSON status frames, never the binary image ones.
+            if (type != "comfy_websocket" || data.Length < 16 || data.Length > 4096 || data[0] != '{')
+            {
+                return;
+            }
+            string head = Encoding.ASCII.GetString(data, 0, Math.Min(48, data.Length));
+            if (head.Contains("execution_cached") && !running && total == 0)
+            {
+                JArray cached = Utilities.ParseToJson(Encoding.UTF8.GetString(data))["data"]?["nodes"] as JArray;
+                if (cached is not null && cached.Any(n => nodeIds.Contains($"{n}")))
+                {
+                    input.ExtraMeta[EnhancementTimeMeta] = "cached";
+                }
+                return;
+            }
+            if (!head.Contains("\"executing\""))
+            {
+                return;
+            }
+            long now = Environment.TickCount64;
+            if (running)
+            {
+                total += now - started;
+                running = false;
+                double sec = total / 1000.0;
+                input.ExtraMeta[EnhancementTimeMeta] = sec > 120 ? $"{sec / 60:0.00} min" : $"{sec:0.00} sec";
+            }
+            string node = $"{Utilities.ParseToJson(Encoding.UTF8.GetString(data))["data"]?["node"]}";
+            if (nodeIds.Contains(node))
+            {
+                running = true;
+                started = now;
+            }
+        };
     }
 
     /// <summary>0 = "a", 25 = "z", 26 = "aa", ... Metadata keys get reduced to their letters when Swarm builds output paths, so numbered keys would collide there.</summary>
