@@ -1,12 +1,14 @@
 using FreneticUtilities.FreneticExtensions;
 using Newtonsoft.Json.Linq;
 using SwarmUI.Accounts;
+using SwarmUI.Backends;
 using SwarmUI.Builtin_ComfyUIBackend;
 using SwarmUI.Core;
 using SwarmUI.Media;
 using SwarmUI.Text2Image;
 using SwarmUI.Utils;
 using SwarmUI.WebAPI;
+using System.Net.WebSockets;
 using System.Runtime.CompilerServices;
 
 namespace PromptEnhancer;
@@ -17,12 +19,12 @@ public class PromptEnhancerExtension : Extension
     /// <summary>Feature flag, auto-enabled on backends that have the 'TextGenerate' node.</summary>
     public const string Feature = "text_generate";
 
-    /// <summary>Value of <see cref="TextEncoder"/> that means "reuse the encoder the diffusion model already loads".</summary>
+    /// <summary>Value of <see cref="PromptUpsampler"/> that means "reuse the encoder the diffusion model already loads".</summary>
     public const string UseModelEncoder = "default";
 
     public static T2IParamGroup Group;
 
-    public static T2IRegisteredParam<string> TextEncoder, EncoderType, SystemPrompt;
+    public static T2IRegisteredParam<string> PromptUpsampler, EncoderType, SystemPrompt;
 
     public static T2IRegisteredParam<int> MaxLength, TopK;
 
@@ -96,36 +98,25 @@ public class PromptEnhancerExtension : Extension
         API.RegisterAPICall(PromptEnhancerListSystemPrompts, false, Permissions.BasicImageGeneration);
         API.RegisterAPICall(PromptEnhancerSaveSystemPrompt, true, PermEditSystemPrompts);
         API.RegisterAPICall(PromptEnhancerDeleteSystemPrompt, true, PermEditSystemPrompts);
-        API.RegisterAPICall(PromptEnhancerEnhancePrompt, false, Permissions.BasicImageGeneration);
-        API.RegisterAPICall(PromptEnhancerCaptionImage, false, Permissions.BasicImageGeneration);
-        // Before LoRAs get applied at -10, so we can drive text generation from the raw text encoder.
-        WorkflowGenerator.AddModelGenStep(TrackBaseModel, -11);
+        API.RegisterAPICall(PromptEnhancerEnhancePromptWS, false, Permissions.BasicImageGeneration);
+        API.RegisterAPICall(PromptEnhancerCaptionImageWS, false, Permissions.BasicImageGeneration);
         // After every stage (refiner, segments, video, ...) has encoded its prompts, and before post-cleanup at 200.
         WorkflowGenerator.AddStep(Apply, 150);
-    }
-
-    /// <summary>Remembers the base model's text encoder as it comes straight out of the loader, since LoRA patches can damage its ability to generate text.</summary>
-    static void TrackBaseModel(WorkflowGenerator g)
-    {
-        if (g.LoadingModelType == "Base" && g.LoadingClip is not null)
-        {
-            g.NodeHelpers.TryAdd("prompt_enhancer_base_clip", $"{g.LoadingClip[0]}:{g.LoadingClip[1]}");
-        }
     }
 
     void RegisterParams()
     {
         Group = new("Prompt Enhancer", Toggles: true, Open: false);
-        TextEncoder = T2IParamTypes.Register<string>(new("[PE] Text Encoder", "Which text encoder generates the enhanced prompt.\n'default' reuses the encoder the selected diffusion model already loads, at no extra VRAM cost - but only works if that encoder is an LLM (Qwen, Gemma, ...).\nOtherwise pick a file from your text encoders folder.",
+        PromptUpsampler = T2IParamTypes.Register<string>(new("[PE] Prompt Upsampler", "Which LLM generates the enhanced prompt.\n'default' reuses the encoder the selected diffusion model already loads, at no extra VRAM cost - but only works if that encoder is an LLM (Qwen, Gemma, ...).\nOtherwise pick a file from your text encoders folder.",
             UseModelEncoder, Group: Group, FeatureFlag: Feature, OrderPriority: 1, Permission: Permissions.ModelParams, GetValues: EncoderValues
             ));
-        SystemPrompt = T2IParamTypes.Register<string>(new("[PE] System Prompt", "Which system prompt instructs the encoder on how to rewrite your prompt.\n'None' sends your prompt through the encoder's own default template.\nUse the 'Edit' button to manage your system prompts.",
+        SystemPrompt = T2IParamTypes.Register<string>(new("[PE] System Prompt", "Which system prompt instructs the prompt upsampler on how to rewrite your prompt.\n'None' sends your prompt through the LLM's own default template.\nUse the 'Edit' button to manage your system prompts.",
             DefaultSystemPrompt, Group: Group, FeatureFlag: Feature, OrderPriority: 2, GetValues: session => ["None", .. SystemPromptsFor(session?.User).Keys.OrderBy(k => k.ToLowerFast())]
             ));
-        PromptImages = T2IParamTypes.Register<bool>(new("[PE] Use Prompt Images", "Also show the images attached to your prompt to the encoder, so it can describe and build on them.\nOnly works with vision-capable encoders (Qwen3-VL, Gemma 3/4, ...).\nFollows the 'Text Encoded Image' setting for image sizing.",
+        PromptImages = T2IParamTypes.Register<bool>(new("[PE] Use Prompt Images", "Also show the images attached to your prompt to the prompt upsampler, so it can describe and build on them.\nOnly works with vision-capable LLMs (Qwen3-VL, Gemma 3/4, ...).\nFollows the 'Text Encoded Image' setting for image sizing.",
             "false", Group: Group, FeatureFlag: Feature, OrderPriority: 3
             ));
-        EncoderType = T2IParamTypes.Register<string>(new("[PE] Encoder Type", "Which ComfyUI text encoder type to load an explicitly chosen encoder as.\nLeave off to use the type that matches the current diffusion model.",
+        EncoderType = T2IParamTypes.Register<string>(new("[PE] Encoder Type", "Which ComfyUI text encoder type to load an explicitly chosen prompt upsampler as.\nLeave off to use the same type the diffusion model loads its own text encoder with.",
             "stable_diffusion", Group: Group, FeatureFlag: Feature, OrderPriority: 4, IsAdvanced: true, Toggleable: true, GetValues: _ => ComfyEncoderTypes
             ));
         MaxLength = T2IParamTypes.Register<int>(new("[PE] Max Length", "Maximum length in tokens of the enhanced prompt.",
@@ -146,7 +137,7 @@ public class PromptEnhancerExtension : Extension
         RepetitionPenalty = T2IParamTypes.Register<double>(new("[PE] Repetition Penalty", "Penalizes tokens that were already generated. 1 disables.",
             "1.05", Min: 0, Max: 5, Step: 0.01, Group: Group, FeatureFlag: Feature, OrderPriority: 10, IsAdvanced: true
             ));
-        Thinking = T2IParamTypes.Register<bool>(new("[PE] Thinking", "Let the encoder reason before answering, if it supports a thinking mode.\nThe reasoning is saved to the image metadata, separately from the enhanced prompt.",
+        Thinking = T2IParamTypes.Register<bool>(new("[PE] Thinking", "Let the prompt upsampler reason before answering, if it supports a thinking mode.\nThe reasoning is saved to the image metadata, separately from the enhanced prompt.",
             "false", Group: Group, FeatureFlag: Feature, OrderPriority: 11, IsAdvanced: true
             ));
         SubPrompts = T2IParamTypes.Register<bool>(new("[PE] Process Sub-Prompts", "Also enhance confined sub-prompts (<region:>, <object:>, <segment:>, <refiner>, <video>, ...) - each one independently.\nOff by default, as it means one text generation pass per sub-prompt.",
@@ -162,7 +153,7 @@ public class PromptEnhancerExtension : Extension
 
     static bool IsGeneratorName(string name) => GeneratorNameMarkers.Any(name.ToLowerFast().Contains);
 
-    /// <summary>Values for <see cref="TextEncoder"/>: generation-capable models from the user's clip folder.</summary>
+    /// <summary>Values for <see cref="PromptUpsampler"/>: generation-capable models from the user's clip folder.</summary>
     static List<string> EncoderValues(Session session)
     {
         IEnumerable<string> local = Program.T2IModelSets["Clip"].ListModelNamesFor(session).Where(IsGeneratorName);
@@ -281,7 +272,7 @@ public class PromptEnhancerExtension : Extension
     /// <summary>Enhances the prompt on its own, without generating an image, for the 'Enhance' button above the prompt box.
     /// Only the global text before the first section ('&lt;base&gt;', '&lt;segment:...&gt;', ...) is enhanced, sections are kept as-is after it.
     /// In that text, prompt functions are resolved first (see <see cref="TextFunctions"/>), and tags that act on the generation itself (loras, presets, ...) are kept after the enhanced text.</summary>
-    public static async Task<JObject> PromptEnhancerEnhancePrompt(Session session,
+    public static async Task<JObject> PromptEnhancerEnhancePromptWS(Session session, WebSocket socket,
         [API.APIParameter("Raw mapping of the generate tab's current parameters, same format as 'GenerateText2Image'.")] JObject rawInput)
     {
         T2IParamInput input = T2IAPI.RequestToParams(session, rawInput);
@@ -320,17 +311,17 @@ public class PromptEnhancerExtension : Extension
         {
             input.Set(SystemPrompt, DefaultSystemPrompt);
         }
-        string enhanced = await RunStandalone(input, resolved);
-        if (kept.Any())
+        string enhanced = await RunStandalone(input, resolved, socket);
+        if (enhanced is not null && kept.Any())
         {
             enhanced = $"{enhanced} {string.Join(" ", kept)}";
         }
-        return new() { ["prompt"] = tail == "" ? enhanced : $"{enhanced}\n{tail}" };
+        return PromptResponse(input, enhanced is null || tail == "" ? enhanced : $"{enhanced}\n{tail}");
     }
 
     /// <summary>Describes an image as a prompt, for the 'PE Caption' image button.
     /// Uses the built-in captioning system prompt, unless the user picked a system prompt other than <see cref="DefaultSystemPrompt"/>.</summary>
-    public static async Task<JObject> PromptEnhancerCaptionImage(Session session,
+    public static async Task<JObject> PromptEnhancerCaptionImageWS(Session session, WebSocket socket,
         [API.APIParameter("Raw mapping of the generate tab's current parameters, same format as 'GenerateText2Image', plus 'pe_caption_image': the image to caption, as a data URL.")] JObject rawInput)
     {
         string imageData = $"{rawInput["pe_caption_image"]}";
@@ -347,31 +338,85 @@ public class PromptEnhancerExtension : Extension
         // The captioned image is the only image the encoder sees, whatever is attached to the prompt box.
         input.Set(T2IParamTypes.PromptImages, [(Image)ImageFile.FromDataString(imageData)]);
         input.Set(PromptImages, true);
-        return new() { ["prompt"] = await RunStandalone(input, "Describe this image.") };
+        return PromptResponse(input, await RunStandalone(input, "Describe this image.", socket));
     }
 
-    /// <summary>Runs a single text generation outside of any image generation: loads the model's encoder exactly as a generation would, then runs only the 'TextGenerate' node (Comfy skips the loader nodes nothing depends on).</summary>
-    static async Task<string> RunStandalone(T2IParamInput input, string prompt)
+    /// <summary>Runs a single text generation outside of any image generation: loads the model's encoder exactly as a generation would, then runs only the 'TextGenerate' node (Comfy skips the loader nodes nothing depends on).
+    /// Goes through Swarm's backend queue like a generation: same backend selection, waits its turn, shows in the session's generation count, and stops on Interrupt. Returns null when interrupted.
+    /// Sends '{"status": "running"}' on the socket once ComfyUI actually starts the workflow, past any wait for a backend.</summary>
+    static async Task<string> RunStandalone(T2IParamInput input, string prompt, WebSocket socket)
     {
-        ComfyUIAPIAbstractBackend backend = ComfyUIBackendExtension.RunningComfyBackends.FirstOrDefault(b => b.SupportedFeatures.Contains(Feature))
-            ?? throw new SwarmUserErrorException("No running ComfyUI backend supports the 'TextGenerate' node.");
         T2IModel model = input.Get(T2IParamTypes.Model, null) ?? throw new SwarmUserErrorException("No model selected.");
         // A random seed per click when the seed is left at -1, so re-clicking gives a new result.
         input.LockSeeds();
-        WorkflowGenerator g = new() { UserInput = input, ModelFolderFormat = backend.ModelFolderFormat, Features = [.. backend.SupportedFeatures], Workflow = [] };
-        g.FinalLoadedModel = model;
-        g.FinalLoadedModelList = [model];
-        (g.FinalLoadedModel, g.CurrentModel, g.CurrentTextEnc, g.CurrentVae) = g.CreateModelLoader(model, "Base", "4", sectionId: T2IParamInput.SectionID_BaseOnly);
-        Enhance(g, Prepare(g), prompt, "enhanced_prompt");
-        await backend.AwaitJobLive(g.Workflow.ToString(), "0", _ => { }, input, Program.GlobalProgramCancel);
+        using Session.GenClaim claim = input.SourceSession.Claim(gens: 1);
+        Func<BackendHandler.T2IBackendData, bool> matcher = T2IEngine.BackendMatcherFor(input);
+        T2IBackendAccess access;
+        claim.Extend(backendWaits: 1);
+        try
+        {
+            // No model given: the diffusion model doesn't need loading, only its text encoder is used.
+            access = await Program.Backends.GetNextT2IBackend(TimeSpan.FromMinutes(Program.ServerSettings.Backends.PerRequestTimeoutMinutes), null, input,
+                filter: b => matcher(b) && b.Backend is ComfyUIAPIAbstractBackend comfy && comfy.SupportedFeatures.Contains(Feature), session: input.SourceSession, cancel: claim.InterruptToken);
+        }
+        catch (TimeoutException)
+        {
+            throw new SwarmUserErrorException("Timeout! All backends are occupied with other tasks.");
+        }
+        finally
+        {
+            claim.Complete(backendWaits: 1);
+        }
+        using (access)
+        {
+            if (claim.ShouldCancel || access?.Backend is not ComfyUIAPIAbstractBackend backend)
+            {
+                return null;
+            }
+            claim.Extend(liveGens: 1);
+            WorkflowGenerator g = new() { UserInput = input, ModelFolderFormat = backend.ModelFolderFormat, Features = [.. backend.SupportedFeatures], Workflow = [] };
+            g.FinalLoadedModel = model;
+            g.FinalLoadedModelList = [model];
+            (g.FinalLoadedModel, g.CurrentModel, g.CurrentTextEnc, g.CurrentVae) = g.CreateModelLoader(model, "Base", "4", sectionId: T2IParamInput.SectionID_BaseOnly);
+            Enhance(g, Prepare(g, g.CurrentTextEnc.Path), prompt, "enhanced_prompt", g.CurrentTextEnc.Path);
+            Task started = null;
+            input.ReceiveRawBackendData = (type, data) =>
+            {
+                if (started is null && type == "comfy_websocket" && data.Length < 4096 && data[0] == '{' && Encoding.ASCII.GetString(data, 0, Math.Min(48, data.Length)).Contains("execution_start"))
+                {
+                    started = socket.SendJson(new JObject() { ["status"] = "running" }, API.WebsocketTimeout);
+                }
+            };
+            await backend.AwaitJobLive(g.Workflow.ToString(), "0", _ => { }, input, claim.InterruptToken);
+            if (started is not null)
+            {
+                await started;
+            }
+        }
+        if (claim.ShouldCancel)
+        {
+            return null;
+        }
         if (input.ExtraMeta.GetValueOrDefault(EnhancedPromptMeta) is not string text || string.IsNullOrWhiteSpace(text))
         {
-            throw new SwarmUserErrorException("The text encoder returned no text.");
+            throw new SwarmUserErrorException("The prompt upsampler returned no text.");
         }
         return text;
     }
 
-    /// <summary>Everything a 'TextGenerate' node needs beyond the prompt itself, resolved once per generation.</summary>
+    /// <summary>Builds a button API response: the new prompt, or an interruption marker, plus any prompt parser warnings (missing wildcard, ...) the way Swarm reports them in image metadata.</summary>
+    static JObject PromptResponse(T2IParamInput input, string prompt)
+    {
+        JObject result = prompt is null ? new() { ["interrupted"] = true } : new() { ["prompt"] = prompt };
+        if (input.ExtraMeta.GetValueOrDefault("parser_warnings") is List<string> warnings && warnings.Any())
+        {
+            result["parser_warnings"] = JArray.FromObject(warnings);
+        }
+        return result;
+    }
+
+    /// <summary>Everything a 'TextGenerate' node needs beyond the prompt itself, resolved once per generation.
+    /// <see cref="Clip"/> is an explicitly chosen encoder, or null to use the diffusion model's own encoder as each prompt's encode node gets it.</summary>
     public record class Setup(JArray Clip, JObject Inputs);
 
     /// <summary>Enhances the global prompt wherever it got encoded, and optionally every sub-prompt, each as its own independent generation.
@@ -379,7 +424,7 @@ public class PromptEnhancerExtension : Extension
     static void Apply(WorkflowGenerator g)
     {
         // The whole group toggles at once, so any one parameter being present means the feature is on.
-        if (!g.UserInput.TryGet(TextEncoder, out string _))
+        if (!g.UserInput.TryGet(PromptUpsampler, out string _))
         {
             return;
         }
@@ -392,12 +437,13 @@ public class PromptEnhancerExtension : Extension
         Setup setup = null;
         Dictionary<string, JArray> enhanced = [];
         int subIndex = 0;
-        JArray enhance(string text)
+        // 'clip' is the text encoder the encode node being replaced uses - the latest one, with LoRAs and other patches applied. A text enhanced once is reused by later nodes.
+        JArray enhance(string text, JArray clip)
         {
             if (!enhanced.TryGetValue(text, out JArray result))
             {
-                setup ??= Prepare(g);
-                result = Enhance(g, setup, text, text == global ? "enhanced_prompt" : $"enhanced_subprompt_{LetterIndex(subIndex++)}");
+                setup ??= Prepare(g, clip);
+                result = Enhance(g, setup, text, text == global ? "enhanced_prompt" : $"enhanced_subprompt_{LetterIndex(subIndex++)}", clip);
                 enhanced[text] = result;
             }
             return result;
@@ -414,9 +460,10 @@ public class PromptEnhancerExtension : Extension
             {
                 continue;
             }
+            JArray clip = inputs["clip"] as JArray;
             if (text == global)
             {
-                inputs[textKey] = enhance(global);
+                inputs[textKey] = enhance(global, clip);
             }
             // Swarm joins them as "{global} {section}", but the global text keeps whatever whitespace (eg a newline) preceded the section tag, so only match on the trimmed parts.
             else if (global != "" && text.StartsWith(global) && suffixes.Contains(text[global.Length..].Trim()))
@@ -424,15 +471,15 @@ public class PromptEnhancerExtension : Extension
                 string suffix = text[global.Length..].Trim();
                 string joined = g.CreateNode("StringConcatenate", new JObject()
                 {
-                    ["string_a"] = enhance(global),
-                    ["string_b"] = subPrompts.Contains(suffix) ? enhance(suffix) : suffix,
+                    ["string_a"] = enhance(global, clip),
+                    ["string_b"] = subPrompts.Contains(suffix) ? enhance(suffix, clip) : suffix,
                     ["delimiter"] = " "
                 });
                 inputs[textKey] = new JArray(joined, 0);
             }
             else if (subPrompts.Contains(text))
             {
-                inputs[textKey] = enhance(text);
+                inputs[textKey] = enhance(text, clip);
             }
         }
         if (enhanced.Any())
@@ -557,25 +604,15 @@ public class PromptEnhancerExtension : Extension
         return null;
     }
 
-    /// <summary>Resolves the encoder, system prompt, and sampling values for this generation.</summary>
-    static Setup Prepare(WorkflowGenerator g)
+    /// <summary>Resolves the prompt upsampler, system prompt, and sampling values for this generation.
+    /// 'modelClip' is the diffusion model's text encoder at the first prompt to enhance, whose loader type an explicitly chosen upsampler reuses.</summary>
+    static Setup Prepare(WorkflowGenerator g, JArray modelClip)
     {
-        // The encoder straight off the loader - the one in CurrentTextEnc has LoRAs patched into it, which damages text generation.
-        JArray baseClip = g.NodeHelpers.TryGetValue("prompt_enhancer_base_clip", out string baseClipRef) ? [baseClipRef.Before(':'), int.Parse(baseClipRef.After(':'))] : g.CurrentTextEnc.Path;
-        JObject baseLoader = FindClipLoader(g, baseClip);
-        string encoderChoice = g.UserInput.Get(TextEncoder, UseModelEncoder);
-        JArray clip;
-        if (encoderChoice == UseModelEncoder)
+        string encoderChoice = g.UserInput.Get(PromptUpsampler, UseModelEncoder);
+        JArray clip = null;
+        if (encoderChoice != UseModelEncoder)
         {
-            bool isGenerator = baseLoader is not null && baseLoader.Properties().Any(p => p.Name.StartsWith("clip_name") && IsGeneratorName($"{p.Value}"));
-            if (!isGenerator)
-            {
-                throw new SwarmUserErrorException("Prompt Enhancer: the selected model's text encoder is not an LLM and cannot generate text. Pick an explicit encoder in '[PE] Text Encoder'.");
-            }
-            clip = baseClip;
-        }
-        else
-        {
+            JObject baseLoader = FindClipLoader(g, modelClip ?? g.CurrentTextEnc.Path);
             string loader = g.CreateNode("CLIPLoader", new JObject()
             {
                 ["clip_name"] = encoderChoice,
@@ -614,7 +651,8 @@ public class PromptEnhancerExtension : Extension
         // The encoder's tokenizer swaps this in for its own system turn, keeping its native chat template (and so thinking mode and image tokens) intact.
         if (system is not null)
         {
-            inputs["system_prompt"] = system;
+            string systemNode = g.CreateNode("PrimitiveStringMultiline", new JObject() { ["value"] = system });
+            inputs["system_prompt"] = new JArray(systemNode, 0);
         }
         return new(clip, inputs);
     }
@@ -631,10 +669,21 @@ public class PromptEnhancerExtension : Extension
     }
 
     /// <summary>Creates a 'TextGenerate' node for one prompt, plus metadata nodes so the user can see what came out of it.</summary>
-    static JArray Enhance(WorkflowGenerator g, Setup setup, string userPrompt, string metaKey)
+    static JArray Enhance(WorkflowGenerator g, Setup setup, string userPrompt, string metaKey, JArray modelClip)
     {
+        JArray clip = setup.Clip;
+        if (clip is null)
+        {
+            clip = modelClip ?? g.CurrentTextEnc.Path;
+            // Checked per encoder actually used: a base and a refiner model can have different ones.
+            JObject loader = FindClipLoader(g, clip);
+            if (loader is null || !loader.Properties().Any(p => p.Name.StartsWith("clip_name") && IsGeneratorName($"{p.Value}")))
+            {
+                throw new SwarmUserErrorException("Prompt Enhancer: the selected model's text encoder is not an LLM and cannot generate text. Pick an explicit LLM in '[PE] Prompt Upsampler'.");
+            }
+        }
         JObject inputs = (JObject)setup.Inputs.DeepClone();
-        inputs["clip"] = setup.Clip.DeepClone();
+        inputs["clip"] = clip.DeepClone();
         inputs["prompt"] = userPrompt;
         string gen = g.CreateNode("TextGenerate", inputs);
         SaveMetadata(g, metaKey, [gen, 0]);

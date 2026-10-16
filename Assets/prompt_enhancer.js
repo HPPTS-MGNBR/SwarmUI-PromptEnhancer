@@ -19,6 +19,10 @@ class PromptEnhancerSystemPrompts {
         button.type = 'button';
         button.className = 'basic-button pe-sysprompt-edit-button';
         button.innerText = 'Edit';
+        if (!permissions.hasPermission('prompt_enhancer_edit_system_prompts')) {
+            button.disabled = true;
+            button.title = 'You do not have permission to edit system prompts.';
+        }
         button.addEventListener('click', () => this.open());
         select.insertAdjacentElement('afterend', button);
     }
@@ -51,8 +55,24 @@ class PromptEnhancerSystemPrompts {
         this.nameInput = document.getElementById('pe_sysprompt_name');
         this.textInput = document.getElementById('pe_sysprompt_text');
         this.deleteButton = document.getElementById('pe_sysprompt_delete');
-        this.list.addEventListener('change', () => this.select(this.list.value));
-        document.getElementById('pe_sysprompt_new').addEventListener('click', () => this.select(null));
+        this.list.addEventListener('change', () => {
+            if (!this.confirmDiscard()) {
+                this.list.value = this.selected ?? '';
+                return;
+            }
+            this.select(this.list.value);
+        });
+        document.getElementById('pe_sysprompt_new').addEventListener('click', () => {
+            if (this.confirmDiscard()) {
+                this.select(null);
+            }
+        });
+        // Covers the Close button, Escape and clicking outside alike.
+        this.modal.addEventListener('hide.bs.modal', e => {
+            if (!this.confirmDiscard()) {
+                e.preventDefault();
+            }
+        });
         document.getElementById('pe_sysprompt_save').addEventListener('click', () => this.save());
         this.deleteButton.addEventListener('click', () => this.delete());
         document.getElementById('pe_sysprompt_close').addEventListener('click', () => $(this.modal).modal('hide'));
@@ -84,6 +104,19 @@ class PromptEnhancerSystemPrompts {
             option.textContent = name;
             this.list.appendChild(option);
         }
+    }
+
+    /** True if the editor holds changes that were not saved. */
+    isDirty() {
+        if (this.selected == null) {
+            return this.nameInput.value.trim() != '' || this.textInput.value.trim() != '';
+        }
+        return this.nameInput.value.trim() != this.selected || this.textInput.value != this.prompts[this.selected];
+    }
+
+    /** Asks before throwing away unsaved changes. True if there are none, or the user agreed to discard them. */
+    confirmDiscard() {
+        return !this.isDirty() || confirm('Discard your unsaved changes to this system prompt?');
     }
 
     /** Shows the given system prompt in the editor, or a blank one when null. */
@@ -146,7 +179,7 @@ class PromptEnhancerButton {
         this.button.type = 'button';
         this.button.className = 'basic-button pe-enhance-button';
         this.button.innerText = this.label;
-        this.button.title = 'Prompt Enhancer: rewrite the prompt with the text encoder, using the Prompt Enhancer settings.\nOnly the text before the first <tag> is rewritten.';
+        this.button.title = 'Prompt Enhancer: rewrite the prompt with the prompt upsampler, using the Prompt Enhancer settings.\nOnly the global text before the first section (<base>, <segment:...>, ...) is rewritten, with its prompt functions (<wildcard:>, <random:>, ...) resolved first.';
         this.button.addEventListener('click', () => this.enhance());
         getRequiredElementById('alt_prompt_region').appendChild(this.button);
     }
@@ -157,28 +190,20 @@ class PromptEnhancerButton {
             return;
         }
         this.setBusy(true);
-        genericRequest('PromptEnhancerEnhancePrompt', this.genInput(), data => {
-            this.setBusy(false);
-            this.box.value = data.prompt;
-            triggerChangeFor(this.box);
-        }, 0, e => {
+        makeWSRequest('PromptEnhancerEnhancePromptWS', this.genInput(), data => this.takeResult(data), 0, e => {
             this.setBusy(false);
             showError(e);
         });
     }
 
-    /** Describes the given image with the text encoder, and replaces the prompt with the result. */
+    /** Describes the given image with the prompt upsampler, and replaces the prompt with the result. */
     caption(src) {
         if (this.button.disabled) {
             return;
         }
         this.setBusy(true, '✨ Captioning...');
         let send = (data) => {
-            genericRequest('PromptEnhancerCaptionImage', this.genInput({ pe_caption_image: data }), result => {
-                this.setBusy(false);
-                this.box.value = result.prompt;
-                triggerChangeFor(this.box);
-            }, 0, e => {
+            makeWSRequest('PromptEnhancerCaptionImageWS', this.genInput({ pe_caption_image: data }), result => this.takeResult(result), 0, e => {
                 this.setBusy(false);
                 showError(e);
             });
@@ -188,6 +213,23 @@ class PromptEnhancerButton {
         }
         else {
             toDataURL(src, send);
+        }
+    }
+
+    /** Handles a server message: the workflow starting (starts the timer), or the result, which goes in the prompt box unless it was interrupted, with any prompt parser warnings shown. */
+    takeResult(data) {
+        if (data.status == 'running') {
+            this.startTimer();
+            return;
+        }
+        this.setBusy(false);
+        if (!data.interrupted) {
+            this.box.value = data.prompt;
+            triggerChangeFor(this.box);
+        }
+        if (data.parser_warnings) {
+            let rect = this.button.getBoundingClientRect();
+            doNoticePopover(data.parser_warnings.join('\n'), 'notice-pop-red', rect.left, rect.bottom);
         }
     }
 
@@ -213,12 +255,23 @@ class PromptEnhancerButton {
 
     /** Locks the button while a request is running. */
     setBusy(busy, text = '✨ Enhancing...') {
+        clearInterval(this.timer);
+        this.busyText = text;
         this.button.disabled = busy;
         this.button.innerText = busy ? text : this.label;
+    }
+
+    /** Counts the seconds since the workflow started running, ie not the time spent waiting for a backend. */
+    startTimer() {
+        clearInterval(this.timer);
+        let start = Date.now();
+        this.timer = setInterval(() => {
+            this.button.innerText = `${this.busyText} ${Math.floor((Date.now() - start) / 1000)}s`;
+        }, 1000);
     }
 }
 
 promptEnhancerButton = new PromptEnhancerButton();
 
 // In the 'More' dropdown, not in the visible button row. Also shown in the history panel: extensions that wrap 'buttonsForImage' (eg Base2Edit) can drop its 'isCurrentImage' argument, which would hide a current-image-only button everywhere.
-registerMediaButton('PE Caption', src => promptEnhancerButton.caption(src), 'Prompt Enhancer: describe this image with the text encoder, and replace the prompt with the description.\nUses the built-in \'Caption\' system prompt, unless you picked another one than \'Default\'.', ['image']);
+registerMediaButton('PE Caption', src => promptEnhancerButton.caption(src), 'Prompt Enhancer: describe this image with the prompt upsampler, and replace the prompt with the description.\nUses the built-in \'Caption\' system prompt, unless you picked another one than \'Default\'.', ['image']);
