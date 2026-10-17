@@ -38,6 +38,7 @@ class PromptEnhancerSystemPrompts {
                         <div class="pe-sysprompt-toolbar">
                             <select class="auto-dropdown" id="pe_sysprompt_list"></select>
                             <button type="button" class="basic-button" id="pe_sysprompt_new">New</button>
+                            <select class="auto-dropdown" id="pe_sysprompt_import" title="Load one of the official system prompts shipped with the extension, as a new system prompt to save."></select>
                             <input type="text" class="auto-text" id="pe_sysprompt_name" placeholder="Name" autocomplete="off">
                         </div>
                         <textarea class="auto-text auto-text-block pe-sysprompt-text" id="pe_sysprompt_text" placeholder="System prompt..."></textarea>
@@ -62,6 +63,8 @@ class PromptEnhancerSystemPrompts {
             }
             this.select(this.list.value);
         });
+        this.importList = document.getElementById('pe_sysprompt_import');
+        this.importList.addEventListener('change', () => this.importLibrary(this.importList.value));
         document.getElementById('pe_sysprompt_new').addEventListener('click', () => {
             if (this.confirmDiscard()) {
                 this.select(null);
@@ -83,6 +86,15 @@ class PromptEnhancerSystemPrompts {
         if (!this.modal) {
             this.buildModal();
         }
+        genericRequest('PromptEnhancerListLibrary', {}, data => {
+            this.importList.innerHTML = '<option value="">Import...</option>';
+            for (let name of data.names) {
+                let option = document.createElement('option');
+                option.value = name;
+                option.textContent = name;
+                this.importList.appendChild(option);
+            }
+        });
         genericRequest('PromptEnhancerListSystemPrompts', {}, data => {
             this.load(data);
             let current = document.getElementById('input_pesystemprompt')?.value;
@@ -104,6 +116,19 @@ class PromptEnhancerSystemPrompts {
             option.textContent = name;
             this.list.appendChild(option);
         }
+    }
+
+    /** Loads an official system prompt from the extension's library into the editor, as a new unsaved system prompt. */
+    importLibrary(name) {
+        this.importList.value = '';
+        if (!name || !this.confirmDiscard()) {
+            return;
+        }
+        genericRequest('PromptEnhancerGetLibraryPrompt', { name: name }, data => {
+            this.select(null);
+            this.nameInput.value = data.name;
+            this.textInput.value = data.text;
+        });
     }
 
     /** True if the editor holds changes that were not saved. */

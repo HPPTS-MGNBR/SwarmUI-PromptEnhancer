@@ -8,6 +8,7 @@ using SwarmUI.Media;
 using SwarmUI.Text2Image;
 using SwarmUI.Utils;
 using SwarmUI.WebAPI;
+using System.IO;
 using System.Net.WebSockets;
 using System.Runtime.CompilerServices;
 
@@ -77,6 +78,9 @@ public class PromptEnhancerExtension : Extension
     /// <summary>User generic-data key the user's system prompts are stored under, as a single JSON object of name to text.</summary>
     const string DataName = "prompt_enhancer";
 
+    /// <summary>Folder of the official system prompts shipped with the extension ('Upsamplers/*.md'), that users can import into their own list.</summary>
+    static string LibraryFolder;
+
     public override void OnPreInit()
     {
         ScriptFiles.Add("Assets/prompt_enhancer.js");
@@ -85,6 +89,7 @@ public class PromptEnhancerExtension : Extension
 
     public override void OnInit()
     {
+        LibraryFolder = $"{FilePath}Upsamplers";
         ComfyUIBackendExtension.NodeToFeatureMap["TextGenerate"] = Feature;
         ComfyUIAPIAbstractBackend.AltCustomMetadataHandlers.Add(StoreMetadata);
         ComfyUIBackendExtension.RawObjectInfoParsers.Add(raw =>
@@ -98,6 +103,8 @@ public class PromptEnhancerExtension : Extension
         API.RegisterAPICall(PromptEnhancerListSystemPrompts, false, Permissions.BasicImageGeneration);
         API.RegisterAPICall(PromptEnhancerSaveSystemPrompt, true, PermEditSystemPrompts);
         API.RegisterAPICall(PromptEnhancerDeleteSystemPrompt, true, PermEditSystemPrompts);
+        API.RegisterAPICall(PromptEnhancerListLibrary, false, Permissions.BasicImageGeneration);
+        API.RegisterAPICall(PromptEnhancerGetLibraryPrompt, false, Permissions.BasicImageGeneration);
         API.RegisterAPICall(PromptEnhancerEnhancePromptWS, false, Permissions.BasicImageGeneration);
         API.RegisterAPICall(PromptEnhancerCaptionImageWS, false, Permissions.BasicImageGeneration);
         // After every stage (refiner, segments, video, ...) has encoded its prompts, and before post-cleanup at 200.
@@ -215,6 +222,27 @@ public class PromptEnhancerExtension : Extension
         stored.Remove(name ?? "");
         session.User.SaveGenericData(DataName, "system_prompts", stored.ToString(Newtonsoft.Json.Formatting.None));
         return SystemPromptsResponse(session.User);
+    }
+
+    /// <summary>Names of the official system prompts shipped in the library folder.</summary>
+    static List<string> LibraryNames() => Directory.Exists(LibraryFolder)
+        ? [.. Directory.EnumerateFiles(LibraryFolder, "*.md").Select(Path.GetFileNameWithoutExtension).OrderBy(n => n.ToLowerFast())]
+        : [];
+
+    public static async Task<JObject> PromptEnhancerListLibrary(Session session)
+    {
+        return new() { ["names"] = JArray.FromObject(LibraryNames()) };
+    }
+
+    public static async Task<JObject> PromptEnhancerGetLibraryPrompt(Session session,
+        [API.APIParameter("Name of the library system prompt, as listed by 'PromptEnhancerListLibrary'.")] string name)
+    {
+        // Only names from the listing, so the request can't reach outside the folder.
+        if (!LibraryNames().Contains(name))
+        {
+            return new() { ["error"] = "Unknown library system prompt." };
+        }
+        return new() { ["name"] = name, ["text"] = (await File.ReadAllTextAsync($"{LibraryFolder}/{name}.md")).Trim() };
     }
 
     #endregion
